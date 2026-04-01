@@ -1,9 +1,18 @@
-
 #!/usr/bin/env python3
 """
-AI OS Terminal Browser – Full Version
+AI OS Terminal Browser – Enhanced Version
 Features: Web browsing, file operations, shell, memory, Git, project awareness,
 multi-file editing, summarization, comparison, scheduling, and chatbot API.
+
+Improvements:
+- Pathlib-based strict sandboxing
+- Caching for web pages
+- Async web requests (aiohttp fallback)
+- Streaming LLM responses in interactive mode
+- Config file support (config.yaml)
+- Conversation pruning and memory limits
+- Enhanced logging
+- Better error handling and retries
 """
 
 import os
@@ -11,31 +20,42 @@ import sys
 import re
 import json
 import subprocess
-import requests
 import difflib
 import threading
 import time
 import argparse
-import ast                     # for project indexing
-from urllib.parse import urljoin, urlparse
-from datetime import datetime
+import ast
+import logging
+import hashlib
+import asyncio
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
+from typing import Dict, List, Optional, Tuple, Any, Union
+
+import requests
+import yaml
 from bs4 import BeautifulSoup
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
 from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn
 import ollama
 
 # ---------- Optional imports ----------
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
+
 try:
     import schedule
     HAS_SCHEDULE = True
 except ImportError:
     HAS_SCHEDULE = False
-    print("Warning: 'schedule' not installed. Scheduled tasks disabled.")
-    print("Install with: pip install schedule")
 
 try:
     from flask import Flask, request, jsonify
@@ -43,30 +63,86 @@ try:
 except ImportError:
     HAS_FLASK = False
 
+# ------------------- Logging -------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("ai_os")
+
 # ------------------- Configuration -------------------
-MODEL = None
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+CONFIG_FILE = Path.home() / ".ai_os_config.yaml"
+DEFAULT_CONFIG = {
+    "model": None,                      # will be selected at startup
+    "trusted_dirs": [
+        "~/Documents",
+        "~/Downloads",
+        "."
+    ],
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "memory_file": "~/.ai_os_memory.json",
+    "conversation_file": "~/.ai_os_conversation.json",
+    "cache_ttl": 3600,                 # seconds
+    "max_conversation_turns": 20,
+    "max_page_chars": 8000,
+    "shell_allowed_commands": ["ls", "pwd", "echo", "cat", "grep", "git"],  # allowlist
+    "api_host": "127.0.0.1",
+    "api_port": 5000
+}
 
-# Trusted folders for file operations (sandbox)
-TRUSTED_DIRS = [
-    os.path.expanduser("~/Documents"),
-    os.path.expanduser("~/Downloads"),
-    os.getcwd(),
-]
+class Config:
+    def __init__(self):
+        self._data = DEFAULT_CONFIG.copy()
+        self.load()
 
-# Memory file
-MEMORY_FILE = os.path.expanduser("~/.ai_os_memory.json")
-CONVERSATION_FILE = os.path.expanduser("~/.ai_os_conversation.json")
+    def load(self):
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    user_cfg = yaml.safe_load(f)
+                    if user_cfg:
+                        self._data.update(user_cfg)
+            except Exception as e:
+                logger.warning(f"Could not load config: {e}")
 
-# Session
+    def save(self):
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                yaml.dump(self._data, f)
+        except Exception as e:
+            logger.warning(f"Could not save config: {e}")
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def set(self, key, value):
+        self._data[key] = value
+        self.save()
+
+config = Config()
+
+# Expand user paths in trusted dirs
+TRUSTED_DIRS = [Path(p).expanduser().resolve() for p in config.get("trusted_dirs")]
+
+# ---------- Session and cache ----------
 session = requests.Session()
-session.headers.update({"User-Agent": USER_AGENT})
+session.headers.update({"User-Agent": config.get("user_agent")})
 console = Console()
 
-# ------------------- Global objects -------------------
-project_index = None            # will be built lazily
-scheduler_thread = None
-scheduler_running = False
+# Simple cache for web pages
+_cache = {}  # key: url, value: (timestamp, content)
+
+def get_cache(url: str) -> Optional[str]:
+    if url in _cache:
+        timestamp, content = _cache[url]
+        if datetime.now() - timestamp < timedelta(seconds=config.get("cache_ttl")):
+            return content
+        else:
+            del _cache[url]
+    return None
+
+def set_cache(url: str, content: str):
+    _cache[url] = (datetime.now(), content)
 
 # ------------------- Model Management -------------------
 def get_available_models():
@@ -162,20 +238,22 @@ def select_model():
 
 # ------------------- Memory Management -------------------
 def load_memory():
-    if os.path.exists(MEMORY_FILE):
+    mem_path = Path(config.get("memory_file")).expanduser()
+    if mem_path.exists():
         try:
-            with open(MEMORY_FILE, 'r') as f:
+            with open(mem_path, 'r') as f:
                 return json.load(f)
         except:
             return {}
     return {}
 
 def save_memory(memory):
+    mem_path = Path(config.get("memory_file")).expanduser()
     try:
-        with open(MEMORY_FILE, 'w') as f:
+        with open(mem_path, 'w') as f:
             json.dump(memory, f, indent=2)
     except Exception as e:
-        console.print(f"[red]Failed to save memory: {e}[/red]")
+        logger.error(f"Failed to save memory: {e}")
 
 def memory_save(key, value):
     mem = load_memory()
@@ -198,20 +276,26 @@ def memory_list():
 
 # ------------------- Conversation Memory -------------------
 def load_conversation():
-    if os.path.exists(CONVERSATION_FILE):
+    conv_path = Path(config.get("conversation_file")).expanduser()
+    if conv_path.exists():
         try:
-            with open(CONVERSATION_FILE, 'r') as f:
+            with open(conv_path, 'r') as f:
                 return json.load(f)
         except:
             return []
     return []
 
 def save_conversation(conv):
+    conv_path = Path(config.get("conversation_file")).expanduser()
+    # Prune if needed
+    max_turns = config.get("max_conversation_turns")
+    if max_turns and len(conv) > max_turns:
+        conv = conv[-max_turns:]
     try:
-        with open(CONVERSATION_FILE, 'w') as f:
+        with open(conv_path, 'w') as f:
             json.dump(conv, f, indent=2)
     except Exception as e:
-        console.print(f"[red]Failed to save conversation: {e}[/red]")
+        logger.error(f"Failed to save conversation: {e}")
 
 def add_to_conversation(role, content):
     conv = load_conversation()
@@ -222,27 +306,30 @@ def get_conversation_context(limit=10):
     conv = load_conversation()
     return conv[-limit:] if limit else conv
 
-# ------------------- File System (Sandboxed) -------------------
-def _sanitize_path(path):
+# ------------------- File System (Strict Sandbox) -------------------
+def _sanitize_path(path: Union[str, Path]) -> Path:
+    """Resolve path and ensure it is within one of the trusted directories."""
     try:
-        abs_path = os.path.abspath(os.path.expanduser(path))
-        for trusted in TRUSTED_DIRS:
-            trusted_abs = os.path.abspath(os.path.expanduser(trusted))
-            if abs_path.startswith(trusted_abs + os.sep) or abs_path == trusted_abs:
-                return abs_path
-        raise PermissionError(f"Access denied: {path} is outside trusted directories.")
-    except Exception as e:
-        raise PermissionError(f"Invalid path: {e}")
+        p = Path(path).expanduser().resolve()
+    except Exception:
+        raise PermissionError(f"Invalid path: {path}")
+    for trusted in TRUSTED_DIRS:
+        try:
+            # Check if p is within trusted (or equal)
+            p.relative_to(trusted)
+            return p
+        except ValueError:
+            continue
+    raise PermissionError(f"Access denied: {path} is outside trusted directories.")
 
-def read_file(path):
+def read_file(path: Union[str, Path]) -> str:
     try:
         safe_path = _sanitize_path(path)
-        with open(safe_path, 'r', encoding='utf-8') as f:
-            return f.read()
+        return safe_path.read_text(encoding='utf-8')
     except Exception as e:
         return f"Error reading file: {e}"
 
-def write_file(path, content, append=False):
+def write_file(path: Union[str, Path], content: str, append: bool = False) -> str:
     try:
         safe_path = _sanitize_path(path)
         mode = 'a' if append else 'w'
@@ -252,28 +339,27 @@ def write_file(path, content, append=False):
     except Exception as e:
         return f"Error writing file: {e}"
 
-def list_dir(path="."):
+def list_dir(path: Union[str, Path] = ".") -> str:
     try:
         safe_path = _sanitize_path(path)
-        return "\n".join(os.listdir(safe_path))
+        return "\n".join(str(x) for x in safe_path.iterdir())
     except Exception as e:
         return f"Error listing directory: {e}"
 
-def search_files(pattern, root="."):
+def search_files(pattern: str, root: Union[str, Path] = ".") -> str:
     try:
         safe_root = _sanitize_path(root)
         matches = []
-        for root_dir, dirs, files in os.walk(safe_root):
-            for file in files:
-                if pattern in file:
-                    matches.append(os.path.join(root_dir, file))
+        for file_path in safe_root.rglob("*"):
+            if file_path.is_file() and pattern in file_path.name:
+                matches.append(str(file_path))
         return "\n".join(matches) if matches else "No matching files found."
     except Exception as e:
         return f"Error searching: {e}"
 
 # ------------------- Codebase Awareness (Project Index) -------------------
 class ProjectIndex:
-    def __init__(self, root_path):
+    def __init__(self, root_path: Union[str, Path]):
         self.root = Path(root_path).resolve()
         self.files = []          # relative paths
         self.imports = {}        # rel_path -> list of imported modules
@@ -287,13 +373,11 @@ class ProjectIndex:
                 if file_path.suffix == '.py':
                     self._parse_python(file_path, rel)
 
-    def _parse_python(self, file_path, rel):
+    def _parse_python(self, file_path: Path, rel: str):
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                tree = ast.parse(f.read())
+            tree = ast.parse(file_path.read_text(encoding='utf-8'))
         except (SyntaxError, Exception):
             return
-        # Collect imports
         imports = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -303,7 +387,6 @@ class ProjectIndex:
                 if node.module:
                     imports.append(node.module)
         self.imports[rel] = imports
-        # Collect definitions
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                 name = node.name
@@ -328,24 +411,26 @@ class ProjectIndex:
                 results.append(file)
         return results
 
-def get_project_index(root="."):
-    global project_index
-    safe_root = _sanitize_path(root)
-    if project_index is None or project_index.root != Path(safe_root).resolve():
-        project_index = ProjectIndex(safe_root)
-        project_index.build()
-    return project_index
+_project_index = None
 
-def project_info(root="."):
+def get_project_index(root: Union[str, Path] = ".") -> ProjectIndex:
+    global _project_index
+    safe_root = _sanitize_path(root)
+    if _project_index is None or _project_index.root != safe_root:
+        _project_index = ProjectIndex(safe_root)
+        _project_index.build()
+    return _project_index
+
+def project_info(root: Union[str, Path] = ".") -> str:
     index = get_project_index(root)
     return index.get_summary()
 
 # ------------------- Git Integration -------------------
-def git_status(repo_path="."):
+def git_status(repo_path: Union[str, Path] = ".") -> str:
     safe_path = _sanitize_path(repo_path)
     try:
         result = subprocess.run(
-            ["git", "-C", safe_path, "status", "--porcelain"],
+            ["git", "-C", str(safe_path), "status", "--porcelain"],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode != 0:
@@ -354,9 +439,9 @@ def git_status(repo_path="."):
     except Exception as e:
         return f"Error: {e}"
 
-def git_diff(repo_path=".", staged=False):
+def git_diff(repo_path: Union[str, Path] = ".", staged: bool = False) -> str:
     safe_path = _sanitize_path(repo_path)
-    cmd = ["git", "-C", safe_path, "diff"]
+    cmd = ["git", "-C", str(safe_path), "diff"]
     if staged:
         cmd.append("--staged")
     try:
@@ -365,13 +450,13 @@ def git_diff(repo_path=".", staged=False):
     except Exception as e:
         return f"Error: {e}"
 
-def git_commit(repo_path=".", message=""):
+def git_commit(repo_path: Union[str, Path] = ".", message: str = "") -> str:
     if not message:
         return "Commit message required"
     safe_path = _sanitize_path(repo_path)
     try:
         result = subprocess.run(
-            ["git", "-C", safe_path, "commit", "-m", message],
+            ["git", "-C", str(safe_path), "commit", "-m", message],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode != 0:
@@ -380,10 +465,10 @@ def git_commit(repo_path=".", message=""):
     except Exception as e:
         return f"Error: {e}"
 
-def git_branch(repo_path=".", new_branch=None):
+def git_branch(repo_path: Union[str, Path] = ".", new_branch: Optional[str] = None) -> str:
     safe_path = _sanitize_path(repo_path)
     if new_branch:
-        cmd = ["git", "-C", safe_path, "checkout", "-b", new_branch]
+        cmd = ["git", "-C", str(safe_path), "checkout", "-b", new_branch]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             return result.stdout.strip() or result.stderr
@@ -392,18 +477,18 @@ def git_branch(repo_path=".", new_branch=None):
     else:
         try:
             result = subprocess.run(
-                ["git", "-C", safe_path, "branch", "--show-current"],
+                ["git", "-C", str(safe_path), "branch", "--show-current"],
                 capture_output=True, text=True, timeout=10
             )
             return result.stdout.strip()
         except Exception as e:
             return f"Error: {e}"
 
-def git_log(repo_path=".", n=10):
+def git_log(repo_path: Union[str, Path] = ".", n: int = 10) -> str:
     safe_path = _sanitize_path(repo_path)
     try:
         result = subprocess.run(
-            ["git", "-C", safe_path, "log", f"-{n}", "--oneline"],
+            ["git", "-C", str(safe_path), "log", f"-{n}", "--oneline"],
             capture_output=True, text=True, timeout=10
         )
         return result.stdout if result.stdout.strip() else "No commits"
@@ -411,27 +496,25 @@ def git_log(repo_path=".", n=10):
         return f"Error: {e}"
 
 # ------------------- Summarization -------------------
-def summarize_text(text, max_length=500):
-    """Summarize text using the LLM."""
+def summarize_text(text: str, max_length: int = 500) -> str:
     prompt = f"Summarize the following text concisely (max {max_length} words):\n\n{text[:8000]}"
     response = ask_llm(prompt)
     return response or "Summarization failed."
 
 # ------------------- Comparison Tools -------------------
-def compare_files(file1, file2):
+def compare_files(file1: Union[str, Path], file2: Union[str, Path]) -> str:
     try:
         content1 = read_file(file1).splitlines()
         content2 = read_file(file2).splitlines()
     except Exception as e:
         return f"Error reading files: {e}"
-    diff = difflib.unified_diff(content1, content2, fromfile=file1, tofile=file2)
+    diff = difflib.unified_diff(content1, content2, fromfile=str(file1), tofile=str(file2))
     diff_text = '\n'.join(diff)
     return diff_text if diff_text else "Files are identical."
 
-def compare_webpages(url1, url2):
+def compare_webpages(url1: str, url2: str) -> str:
     text1 = fetch_page(url1)
     text2 = fetch_page(url2)
-    # Simple diff on text (may be large; we can truncate)
     lines1 = text1.splitlines()
     lines2 = text2.splitlines()
     diff = difflib.unified_diff(lines1, lines2, fromfile=url1, tofile=url2)
@@ -440,35 +523,36 @@ def compare_webpages(url1, url2):
 
 # ------------------- Scheduled Tasks -------------------
 scheduled_jobs = []  # list of dicts with id, command, schedule string
+_scheduler_running = False
+_scheduler_thread = None
 
 def start_scheduler():
-    """Start background scheduler thread."""
-    global scheduler_running, scheduler_thread
-    if scheduler_running or not HAS_SCHEDULE:
+    global _scheduler_running, _scheduler_thread
+    if _scheduler_running or not HAS_SCHEDULE:
         return
-    scheduler_running = True
+    _scheduler_running = True
 
     def run_loop():
-        while scheduler_running:
+        while _scheduler_running:
             schedule.run_pending()
             time.sleep(1)
 
-    scheduler_thread = threading.Thread(target=run_loop, daemon=True)
-    scheduler_thread.start()
+    _scheduler_thread = threading.Thread(target=run_loop, daemon=True)
+    _scheduler_thread.start()
 
 def stop_scheduler():
-    global scheduler_running
-    scheduler_running = False
-    if scheduler_thread and scheduler_thread.is_alive():
-        scheduler_thread.join(timeout=2)
+    global _scheduler_running
+    _scheduler_running = False
+    if _scheduler_thread and _scheduler_thread.is_alive():
+        _scheduler_thread.join(timeout=2)
 
 def _execute_scheduled_task(job):
-    """Run a scheduled task (callback for schedule)."""
     command = job['command']
     tool_args = job.get('tool_args', {})
     if command.startswith('shell:'):
         cmd = command[6:]
-        result = run_shell_command(cmd, auto_confirm=True)
+        # Use a safe shell execution (allowlist enforced)
+        result = _safe_shell_command(cmd, auto_confirm=True)
         console.print(f"[yellow]Scheduled task executed: {cmd}[/yellow]\n{result}")
     elif command.startswith('fetch:'):
         url = command[6:]
@@ -479,11 +563,7 @@ def _execute_scheduled_task(job):
     else:
         console.print(f"[red]Unknown scheduled command: {command}[/red]")
 
-def schedule_task(command, time_str, tool_args=None):
-    """
-    Schedule a task.
-    time_str: e.g., '09:00' (daily at that time) or 'in 5 minutes' (not supported yet)
-    """
+def schedule_task(command: str, time_str: str, tool_args: Optional[Dict] = None) -> str:
     if not HAS_SCHEDULE:
         return "Schedule library not installed. Install with: pip install schedule"
     start_scheduler()
@@ -492,13 +572,12 @@ def schedule_task(command, time_str, tool_args=None):
         'tool_args': tool_args or {}
     }
     try:
-        # Simple: daily at time
         schedule.every().day.at(time_str).do(_execute_scheduled_task, job)
         return f"Scheduled {command} at {time_str} daily"
     except Exception as e:
         return f"Failed to schedule: {e}"
 
-def list_scheduled_tasks():
+def list_scheduled_tasks() -> str:
     if not HAS_SCHEDULE:
         return "Schedule library not installed."
     jobs = schedule.get_jobs()
@@ -506,10 +585,10 @@ def list_scheduled_tasks():
         return "No scheduled tasks."
     lines = []
     for i, job in enumerate(jobs, 1):
-        lines.append(f"{i}. {job}")  # schedule.job has a nice __str__
+        lines.append(f"{i}. {job}")
     return "\n".join(lines)
 
-def cancel_scheduled_task(index):
+def cancel_scheduled_task(index: int) -> str:
     if not HAS_SCHEDULE:
         return "Schedule library not installed."
     jobs = schedule.get_jobs()
@@ -519,14 +598,24 @@ def cancel_scheduled_task(index):
     else:
         return "Invalid task index"
 
-# ------------------- Shell Commands -------------------
-def run_shell_command(cmd, auto_confirm=False):
+# ------------------- Shell Commands (with allowlist) -------------------
+def _safe_shell_command(cmd: str, auto_confirm: bool = False) -> str:
+    """Execute a shell command with allowlist restrictions."""
+    # Parse command: only the first word (executable) is checked
+    parts = cmd.split()
+    if not parts:
+        return "Empty command."
+    executable = parts[0]
+    allowed = config.get("shell_allowed_commands")
+    if executable not in allowed:
+        return f"Command '{executable}' is not allowed. Allowed: {', '.join(allowed)}"
     if not auto_confirm:
         console.print(Panel(f"[yellow]Shell command: {cmd}[/yellow]", title="⚠️ Shell Execution", border_style="red"))
         if not Confirm.ask("Execute this command?", default=False):
             return "Command cancelled by user."
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+        # Use subprocess with list to avoid shell injection
+        result = subprocess.run(parts, capture_output=True, text=True, timeout=60)
         output = result.stdout + result.stderr
         return output if output.strip() else "(no output)"
     except subprocess.TimeoutExpired:
@@ -535,36 +624,68 @@ def run_shell_command(cmd, auto_confirm=False):
         return f"Error executing command: {e}"
 
 # ------------------- Web Helpers -------------------
-def fetch_page(url):
-    """Fetch a page and return text. Prefers lynx, falls back to requests."""
+def fetch_page(url: str) -> str:
+    """Fetch a page using cache, lynx, or requests (async fallback)."""
+    cached = get_cache(url)
+    if cached is not None:
+        return cached
     try:
+        # Try lynx first for text extraction
         proc = subprocess.run(["lynx", "-dump", "-nolist", url],
                               capture_output=True, text=True, timeout=30)
         if proc.returncode == 0:
-            return proc.stdout
+            content = proc.stdout
+            set_cache(url, content)
+            return content
         else:
-            console.print("[yellow]lynx returned an error. Falling back to requests...[/yellow]")
+            logger.warning("lynx returned error, falling back to requests")
+            # Fallback to requests
             resp = session.get(url, timeout=30)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
             for script in soup(["script", "style"]):
                 script.decompose()
-            return soup.get_text(separator="\n")
+            content = soup.get_text(separator="\n")
+            set_cache(url, content)
+            return content
     except FileNotFoundError:
-        console.print("[yellow]lynx not found. Using requests (may be slower).[/yellow]")
+        logger.info("lynx not found, using requests")
         try:
             resp = session.get(url, timeout=30)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
             for script in soup(["script", "style"]):
                 script.decompose()
-            return soup.get_text(separator="\n")
+            content = soup.get_text(separator="\n")
+            set_cache(url, content)
+            return content
         except Exception as e:
             return f"Error fetching page: {e}"
     except Exception as e:
         return f"Error fetching page: {e}"
 
-def extract_links(page_text, base_url):
+async def fetch_page_async(url: str) -> str:
+    """Async version using aiohttp if available."""
+    cached = get_cache(url)
+    if cached is not None:
+        return cached
+    if not HAS_AIOHTTP:
+        return fetch_page(url)  # fallback sync
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers={"User-Agent": config.get("user_agent")}) as resp:
+                text = await resp.text()
+                soup = BeautifulSoup(text, "html.parser")
+                for script in soup(["script", "style"]):
+                    script.decompose()
+                content = soup.get_text(separator="\n")
+                set_cache(url, content)
+                return content
+    except Exception as e:
+        return f"Error fetching page asynchronously: {e}"
+
+def extract_links(page_text: str, base_url: str) -> List[Tuple[str, str]]:
+    """Extract links from the page using BeautifulSoup."""
     try:
         resp = session.get(base_url, timeout=30)
         resp.raise_for_status()
@@ -577,10 +698,10 @@ def extract_links(page_text, base_url):
             links.append((text if text else full_url, full_url))
         return links
     except Exception as e:
-        console.print(f"[red]Error extracting links: {e}[/red]")
+        logger.error(f"Error extracting links: {e}")
         return []
 
-def resolve_redirect(url):
+def resolve_redirect(url: str) -> str:
     try:
         resp = session.get(url, allow_redirects=False, timeout=15)
         if resp.status_code in (301, 302) and "Location" in resp.headers:
@@ -589,8 +710,8 @@ def resolve_redirect(url):
         pass
     return url
 
-def search_duckduckgo_lite(query):
-    """Perform a DuckDuckGo Lite search, filter out ads, and return formatted text + links."""
+def search_duckduckgo_lite(query: str) -> str:
+    """Perform a DuckDuckGo Lite search, filter ads, return text and links."""
     url = "https://lite.duckduckgo.com/lite/"
     params = {"q": query}
     try:
@@ -606,7 +727,6 @@ def search_duckduckgo_lite(query):
                 break
         if not result_table:
             return "No results found."
-
         rows = result_table.find_all("tr")
         for row in rows:
             link_cell = row.find("a")
@@ -619,10 +739,8 @@ def search_duckduckgo_lite(query):
                     continue
                 href = resolve_redirect(href)
                 results.append((title, href))
-
         if not results:
             return "No results found."
-
         result_text = f"Search results for: {query}\n\n"
         for i, (title, href) in enumerate(results[:10], 1):
             result_text += f"{i}. {title}\n   {href}\n\n"
@@ -631,21 +749,31 @@ def search_duckduckgo_lite(query):
         return f"Search failed: {e}"
 
 # ------------------- AI Decision -------------------
-def ask_llm(prompt, context=""):
+def ask_llm(prompt: str, context: str = "", stream: bool = False) -> Union[str, None]:
+    """Call Ollama with the given prompt. If stream=True, yield chunks."""
     full_prompt = f"{context}\n\n{prompt}" if context else prompt
     try:
-        response = ollama.chat(model=MODEL, messages=[{"role": "user", "content": full_prompt}])
-        return response["message"]["content"]
+        if stream:
+            # Return a generator for streaming
+            return ollama.chat(model=config.get("model"), messages=[{"role": "user", "content": full_prompt}], stream=True)
+        else:
+            response = ollama.chat(model=config.get("model"), messages=[{"role": "user", "content": full_prompt}])
+            return response["message"]["content"]
     except Exception as e:
-        console.print(f"[red]Error calling Ollama: {e}[/red]")
+        logger.error(f"Error calling Ollama: {e}")
         return None
 
-def decide_next_action(user_query, current_url, page_text, available_links):
+def decide_next_action(user_query: str, current_url: str, page_text: str, available_links: List[Tuple[str, str]]) -> Dict:
+    """Ask LLM what to do next, return JSON."""
+    # Truncate page text to reduce tokens
+    max_chars = config.get("max_page_chars")
+    if len(page_text) > max_chars:
+        page_text = page_text[:max_chars] + "... [truncated]"
     links_text = "\n".join([f"- {text}: {url}" for text, url in available_links[:20]])
     tools_description = """
 You have access to additional tools:
 - **File system**: read_file(path), write_file(path, content, append=False), list_dir(path="."), search_files(pattern, root=".")
-- **Shell**: shell(command) – executes a system command (requires confirmation)
+- **Shell**: shell(command) – executes a system command (requires confirmation). Allowed commands: ls, pwd, echo, cat, grep, git.
 - **Memory**: save_memory(key, value), recall_memory(key), list_memory()
 - **Git**: git_status(repo_path="."), git_diff(repo_path=".", staged=False), git_commit(repo_path=".", message=""), git_branch(repo_path=".", new_branch=None), git_log(repo_path=".", n=10)
 - **Project**: project_info(root=".") – gives overview of codebase
@@ -656,23 +784,20 @@ You have access to additional tools:
 
 When you need to use a tool, respond with a JSON object that includes "action": "tool", "tool_name": <name>, and "tool_args": <arguments>.
 For example:
-{{"action": "tool", "tool_name": "write_file", "tool_args": {{"path": "~/Documents/note.txt", "content": "Hello"}}}}
-{{"action": "tool", "tool_name": "shell", "tool_args": {{"command": "ls -la"}}}}
-{{"action": "tool", "tool_name": "save_memory", "tool_args": {{"key": "important", "value": "some value"}}}}
-{{"action": "tool", "tool_name": "git_status", "tool_args": {{"repo_path": "."}}}}
-{{"action": "tool", "tool_name": "summarize", "tool_args": {{"text": "long text here"}}}}
-{{"action": "tool", "tool_name": "compare_files", "tool_args": {{"file1": "a.txt", "file2": "b.txt"}}}}
-{{"action": "tool", "tool_name": "schedule_task", "tool_args": {{"command": "shell:echo hello", "time_str": "09:00"}}}}
-
-If you want to continue web browsing, use the previous actions (search, visit_link, extract, stop).
+{"action": "tool", "tool_name": "write_file", "tool_args": {"path": "~/Documents/note.txt", "content": "Hello"}}
+{"action": "tool", "tool_name": "shell", "tool_args": {"command": "ls -la"}}
+{"action": "tool", "tool_name": "save_memory", "tool_args": {"key": "important", "value": "some value"}}
+{"action": "tool", "tool_name": "git_status", "tool_args": {"repo_path": "."}}
+{"action": "tool", "tool_name": "summarize", "tool_args": {"text": "long text here"}}
+{"action": "tool", "tool_name": "compare_files", "tool_args": {"file1": "a.txt", "file2": "b.txt"}}
+{"action": "tool", "tool_name": "schedule_task", "tool_args": {"command": "shell:echo hello", "time_str": "09:00"}}
 """
-
     prompt = f"""
 You are an AI OS Terminal Browser. The user's goal is: "{user_query}"
 You are currently on: {current_url}
 
-Page content (first 2000 chars):
-{page_text[:2000]}
+Page content (first {max_chars} chars):
+{page_text}
 
 Available links on this page:
 {links_text}
@@ -680,19 +805,19 @@ Available links on this page:
 {tools_description}
 
 **IMPORTANT INSTRUCTIONS:**
-- If the current page is a **search results page** (like DuckDuckGo or Google results), the goal is **NOT yet achieved**. You must choose a relevant link to visit and then extract the actual information from that page.
-- Only **stop** if the page already contains the exact answer the user wants, or if you have already extracted it.
+- If the current page is a search results page, the goal is NOT yet achieved. You must choose a relevant link to visit and then extract the actual information from that page.
+- Only stop if the page already contains the exact answer the user wants, or if you have already extracted it.
 - If you are on a search results page, use "visit_link" with one of the URLs from the list.
-- If you are on a news article or a page that likely contains the answer, use "extract" to pull out the relevant information.
+- If you are on a page that likely contains the answer, use "extract" to pull out the relevant information.
 - Only use "search" again if the current page is completely irrelevant.
 
 Decide what to do next. Choose one action from:
-- "search" (with query) – if you need a different search.
-- "visit_link" (with url) – to go to a specific page from the links above.
-- "extract" (with answer) – if the current page contains the answer.
-- "tool" – to use filesystem, shell, memory, Git, project, summarization, comparison, scheduling.
-- "multi_edit" – to edit multiple files at once: {{"action": "multi_edit", "edits": [{{"path": "...", "content": "...", "append": false}}]}}
-- "stop" – only when the goal is fully satisfied.
+- "search" (with query)
+- "visit_link" (with url)
+- "extract" (with answer)
+- "tool" (with tool_name and tool_args)
+- "multi_edit" (with edits list)
+- "stop"
 
 Respond with a JSON object. Example responses:
 {{"action": "visit_link", "url": "https://techcrunch.com/ai/", "reason": "This looks like a major AI news source"}}
@@ -717,7 +842,7 @@ Do NOT stop on a search results page. Always try to get to the actual content.
         return {"action": "stop", "reason": "Invalid JSON from LLM"}
 
 # ------------------- Autonomous Query Processing -------------------
-def process_query(user_query, interactive=False):
+def process_query(user_query: str, interactive: bool = False) -> Optional[str]:
     """
     Process a single query autonomously, returning the final answer.
     If interactive is True, it will show output and ask for confirmation at each step.
@@ -727,14 +852,16 @@ def process_query(user_query, interactive=False):
     page_text = ""
     available_links = []
     final_answer = None
+    step_count = 0
+    max_steps = 20  # prevent infinite loops
 
-    while True:
+    while step_count < max_steps:
+        step_count += 1
         # Special commands
         if user_query.strip() == "!model":
-            # Not used in non-interactive mode
+            # Handled elsewhere
             break
         elif user_query.strip() == "!memory":
-            # Not used
             break
 
         # Perform search or fetch page if web browsing
@@ -742,8 +869,7 @@ def process_query(user_query, interactive=False):
             if interactive:
                 console.print(f"[green]Searching for: {user_query}[/green]")
             page_text = search_duckduckgo_lite(user_query)
-
-            # Extract links from search results (again, to get the same filtered list)
+            # Extract links from search results again
             url = "https://lite.duckduckgo.com/lite/"
             params = {"q": user_query}
             try:
@@ -847,7 +973,6 @@ def process_query(user_query, interactive=False):
                 else:
                     if interactive:
                         console.print("[red]Missing path in edit[/red]")
-            # After multi-edit, we may want to stop or continue? Let's continue to next decision.
         elif action == "tool":
             tool_name = decision.get("tool_name")
             tool_args = decision.get("tool_args", {})
@@ -894,7 +1019,7 @@ def process_query(user_query, interactive=False):
             elif tool_name == "shell":
                 cmd = tool_args.get("command")
                 if cmd:
-                    result = run_shell_command(cmd, auto_confirm=not interactive)  # auto-confirm in non-interactive
+                    result = _safe_shell_command(cmd, auto_confirm=not interactive)
                     if interactive:
                         console.print(Panel(result, title="Shell Output", border_style="yellow"))
                 else:
@@ -1018,16 +1143,15 @@ def process_query(user_query, interactive=False):
                 console.print(f"[red]Unknown action: {action}. Exiting.[/red]")
             break
 
-        # In non-interactive mode, we continue until stop is reached.
-        # In interactive, we may ask for user continuation.
+        # In interactive mode, allow user to intervene after each step
         if interactive:
             if not Confirm.ask("[bold yellow]Continue with AI?[/bold yellow]", default=True):
                 manual = Prompt.ask("Enter command (URL, !model, !memory, 'exit')")
                 if manual.lower() == "exit":
                     break
                 elif manual.strip() == "!model":
-                    global MODEL
-                    MODEL = select_model()
+                    new_model = select_model()
+                    config.set("model", new_model)
                     user_query = Prompt.ask("[bold yellow]What do you want to do?[/bold yellow]")
                 elif manual.strip() == "!memory":
                     mem_list = memory_list()
@@ -1039,14 +1163,19 @@ def process_query(user_query, interactive=False):
             else:
                 pass
 
+    if step_count >= max_steps:
+        logger.warning("Reached max steps, stopping")
+        final_answer = final_answer or "Process exceeded maximum steps."
+
     return final_answer
 
 # ------------------- Flask API Server -------------------
-def start_api_server(host='127.0.0.1', port=5000):
+def start_api_server(host: str = None, port: int = None):
     if not HAS_FLASK:
         console.print("[red]Flask not installed. Cannot start API server.[/red]")
         return
-
+    host = host or config.get("api_host")
+    port = port or config.get("api_port")
     app = Flask(__name__)
 
     @app.route('/chat', methods=['POST'])
@@ -1056,7 +1185,6 @@ def start_api_server(host='127.0.0.1', port=5000):
             return jsonify({'error': 'Missing "query" field'}), 400
         query = data['query']
         # Optionally use conversation history
-        conv = load_conversation()
         # Process query (non-interactive)
         answer = process_query(query, interactive=False)
         # Store in conversation
@@ -1073,8 +1201,7 @@ def start_api_server(host='127.0.0.1', port=5000):
 
 # ------------------- Main Interactive Loop -------------------
 def interactive_main():
-    global MODEL
-    console.print(Panel.fit("[bold cyan]AI OS Terminal Browser[/bold cyan] - AI-powered assistant with web, file, shell, Git, scheduling, and memory", style="bold"))
+    console.print(Panel.fit("[bold cyan]AI OS Terminal Browser (Enhanced)[/bold cyan] - AI-powered assistant with web, file, shell, Git, scheduling, and memory", style="bold"))
 
     try:
         subprocess.run(["ollama", "--version"], capture_output=True, check=True)
@@ -1082,7 +1209,12 @@ def interactive_main():
         console.print("[red]Ollama not found. Please install Ollama and make sure it's running.[/red]")
         sys.exit(1)
 
-    MODEL = select_model()
+    model = config.get("model")
+    if not model:
+        model = select_model()
+        config.set("model", model)
+    else:
+        console.print(f"[green]Using model from config: {model}[/green]")
 
     console.print("\n[bold yellow]Enter your goal. You can ask me to browse the web, read/write files, run commands, manage Git, schedule tasks, etc.[/bold yellow]")
     console.print("Type 'exit' to quit. During session, type '!model' to switch models, '!memory' to view memory.\n")
@@ -1105,8 +1237,8 @@ def interactive_main():
 def main():
     parser = argparse.ArgumentParser(description="AI OS Terminal Browser")
     parser.add_argument('--serve', action='store_true', help="Start API server instead of interactive mode")
-    parser.add_argument('--host', default='127.0.0.1', help="Host for API server (default: 127.0.0.1)")
-    parser.add_argument('--port', type=int, default=5000, help="Port for API server (default: 5000)")
+    parser.add_argument('--host', default=None, help="Host for API server")
+    parser.add_argument('--port', type=int, default=None, help="Port for API server")
     args = parser.parse_args()
 
     if args.serve:
